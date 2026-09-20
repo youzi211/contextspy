@@ -560,6 +560,10 @@ class TestGetAdapter:
     def test_opencode_zen_openai_path(self):
         assert get_adapter("/zen/v1/chat/completions").format_id == "openai_chat"
 
+    def test_model_gateway_chat_completions(self):
+        """Custom gateway /model-gateway/v1/chat/completions must dispatch to OpenAI Chat adapter."""
+        assert get_adapter("/model-gateway/v1/chat/completions").format_id == "openai_chat"
+
     def test_messages_checked_before_responses(self):
         assert get_adapter("/responses/messages").format_id == "anthropic"
 
@@ -1843,6 +1847,12 @@ class TestProviderDetection:
     def test_ollama_port(self):
         assert _detect_provider("localhost", 11434) == "ollama"
         assert _detect_provider("127.0.0.1", 11434) == "ollama"
+
+    def test_custom_openai_gateway(self):
+        assert _detect_provider("aiagent.lakala.com", 443) == "openai"
+
+    def test_custom_openai_gateway_subdomain(self):
+        assert _detect_provider("api.aiagent.lakala.com", 443) == "openai"
 
     def test_unknown_host_returns_none(self):
         assert _detect_provider("example.com", 443) is None

@@ -70,6 +70,9 @@ _HOST_PROVIDER: list[tuple[str, str]] = [
     # non-LLM traffic — analytics-events, wham/usage, otlp/metrics) but that's fine: the
     # endpoint-pattern gate in _save_request/get_adapter still filters those out.
     ("chatgpt.com", "openai_chatgpt"),
+    # Custom OpenAI-compatible gateways (e.g. enterprise model gateways).
+    # Endpoint dispatch (/chat/completions substring) picks the correct adapter.
+    ("aiagent.lakala.com", "openai"),
 ]
 _OLLAMA_PORTS = {11434}
 
