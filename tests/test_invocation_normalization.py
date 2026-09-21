@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from contextspy.analysis.adapters import get_adapter
 from contextspy.analysis.adapters.openai_responses import OpenAIResponsesAdapter
 from contextspy.analysis.capture import CapturedEvent
 from contextspy.analysis.invocations import (
@@ -739,9 +740,14 @@ def test_rest_capture_stores_the_exact_canonical_json_given_to_analysis(tmp_path
     )
 
     # Task 3 requires request-stage admission before any body read — prime it.
-    from contextspy.proxy.providers import build_provider_registry
+    from contextspy.proxy.providers import ProviderRoute, build_provider_registry
     flow.metadata["contextspy_capture_status"] = "provider_route_matched"
     flow.metadata["contextspy_provider"] = "openai"
+    flow.metadata["contextspy_provider_route"] = ProviderRoute(
+        host=None, provider="openai", include_subdomains=False,
+        allowed_protocols=None, source="reverse_target",
+    )
+    flow.metadata["contextspy_adapter"] = get_adapter(flow.request.path)
     ContextSpyAddon(provider_registry=build_provider_registry([]))._handle_response(flow)
 
     with get_db() as db:
