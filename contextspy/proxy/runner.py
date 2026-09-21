@@ -23,10 +23,12 @@ from mitmproxy.tools.dump import DumpMaster
 from mitmproxy.addons import errorcheck as _errorcheck
 
 from contextspy.proxy.addon import ContextSpyAddon
+from contextspy.proxy.providers import ProviderRoute
 
 if TYPE_CHECKING:
     from contextspy.api.websocket import ConnectionManager
     from contextspy.config import Settings, ReverseTarget
+    from contextspy.proxy.providers import ProviderRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +93,17 @@ def _make_master(
     return thread  # type: ignore[return-value]
 
 
-def start_proxy(settings: "Settings", ws_manager: "ConnectionManager | None" = None) -> None:
+def start_proxy(
+    settings: "Settings",
+    registry: "ProviderRegistry",
+    ws_manager: "ConnectionManager | None" = None,
+) -> None:
     global _master, _thread, _addon, _bound
 
     if _master is not None:
         return  # already running
 
-    _addon = ContextSpyAddon()
+    _addon = ContextSpyAddon(provider_registry=registry)
     _addon.ws_manager = ws_manager
 
     options = Options(
@@ -161,6 +167,7 @@ def start_proxy(settings: "Settings", ws_manager: "ConnectionManager | None" = N
 
 def start_local_proxies(
     settings: "Settings",
+    registry: "ProviderRegistry",
     ws_manager: "ConnectionManager | None" = None,
 ) -> None:
     """Start one reverse-mode mitmproxy instance per [[reverse_targets]] entry."""
@@ -171,7 +178,14 @@ def start_local_proxies(
         return
 
     for target in settings.reverse_targets:
-        addon = ContextSpyAddon(provider_override=target.provider)
+        fixed_route = ProviderRoute(
+            host=None,
+            provider=target.provider,
+            include_subdomains=False,
+            allowed_protocols=None,
+            source="reverse_target",
+        )
+        addon = ContextSpyAddon(provider_registry=registry, fixed_route=fixed_route)
         addon.ws_manager = ws_manager
 
         options = Options(

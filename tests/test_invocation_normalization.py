@@ -547,7 +547,8 @@ def test_codex_websocket_tool_loop_persists_one_full_canonical_row_per_invocatio
     from contextspy.proxy.ws_protocols import CompletedExchange
 
     init_db(tmp_path / "codex_loop.db")
-    addon = ContextSpyAddon()
+    from contextspy.proxy.providers import build_provider_registry
+    addon = ContextSpyAddon(provider_registry=build_provider_registry([]))
     state = _WsFlowState(
         session=None,
         provider="openai_chatgpt",
@@ -672,7 +673,8 @@ def test_provider_response_id_is_idempotent(tmp_path):
     from contextspy.proxy.ws_protocols import CompletedExchange
 
     init_db(tmp_path / "codex_duplicate.db")
-    addon = ContextSpyAddon()
+    from contextspy.proxy.providers import build_provider_registry
+    addon = ContextSpyAddon(provider_registry=build_provider_registry([]))
     state = _WsFlowState(
         session=None, provider="openai_chatgpt", agent="codex",
         endpoint="/backend-api/codex/responses", protocol_id="codex_responses",
@@ -736,7 +738,11 @@ def test_rest_capture_stores_the_exact_canonical_json_given_to_analysis(tmp_path
         metadata={"contextspy_request_body": request_text},
     )
 
-    ContextSpyAddon()._handle_response(flow)
+    # Task 3 requires request-stage admission before any body read — prime it.
+    from contextspy.proxy.providers import build_provider_registry
+    flow.metadata["contextspy_capture_status"] = "provider_route_matched"
+    flow.metadata["contextspy_provider"] = "openai"
+    ContextSpyAddon(provider_registry=build_provider_registry([]))._handle_response(flow)
 
     with get_db() as db:
         rows = crud.list_requests(db)

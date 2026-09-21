@@ -214,3 +214,69 @@ def test_rejects_exact_builtin_host_conflict_but_allows_specific_child():
         build_provider_registry([route("API.OPENAI.COM.", "custom")])
     registry = build_provider_registry([route("tenant.chatgpt.com", "tenant")])
     assert registry.match("tenant.chatgpt.com", 443).provider == "tenant"
+
+
+# ---------------------------------------------------------------------------
+# App state, runner plumbing, PAC
+# ---------------------------------------------------------------------------
+
+
+def test_create_app_builds_one_registry_and_exposes_it_on_state(tmp_path: Path):
+    from contextspy.api.main import create_app
+
+    settings = Settings(config_dir=tmp_path)
+    settings.provider_routes = [route("gateway.example.com", "gateway")]
+    app = create_app(settings)
+    matched = app.state.provider_registry.match("gateway.example.com", 443)
+    assert matched.provider == "gateway"
+
+
+def test_proxy_start_passes_the_app_registry(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from contextspy.api.routers.proxy import proxy_start
+    from contextspy.proxy.providers import build_provider_registry
+
+    settings = Settings(config_dir=tmp_path)
+    registry = build_provider_registry([])
+    ws_manager = object()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        settings=settings,
+        provider_registry=registry,
+        ws_manager=ws_manager,
+    )))
+    captured: dict = {}
+    monkeypatch.setattr("contextspy.api.routers.proxy.runner.is_running", lambda: False)
+    monkeypatch.setattr(
+        "contextspy.api.routers.proxy.runner.start_proxy",
+        lambda actual_settings, actual_registry, actual_ws: captured.update(
+            settings=actual_settings, registry=actual_registry, ws=actual_ws,
+        ),
+    )
+    assert proxy_start(request) == {"status": "started"}
+    assert captured == {"settings": settings, "registry": registry, "ws": ws_manager}
+
+
+def test_proxy_pac_uses_registry_and_respects_subdomain_flag(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from contextspy.api.routers.proxy import proxy_pac
+    from contextspy.proxy.providers import build_provider_registry
+
+    settings = Settings(config_dir=tmp_path)
+    settings.proxy.port = 9999
+    registry = build_provider_registry([
+        route("exact.example.com", "exact"),
+        route("tree.example.com", "tree", include_subdomains=True),
+    ])
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        settings=settings, provider_registry=registry,
+    )))
+    body = proxy_pac(request).body.decode()
+    assert 'shExpMatch(host, "exact.example.com")' in body
+    assert 'shExpMatch(host, "*.exact.example.com")' not in body
+    assert 'shExpMatch(host, "tree.example.com")' in body
+    assert 'shExpMatch(host, "*.tree.example.com")' in body
+    assert 'shExpMatch(host, "api.openai.com")' in body
+    assert "11434" not in body
+    assert 'return "PROXY 127.0.0.1:9999"' in body

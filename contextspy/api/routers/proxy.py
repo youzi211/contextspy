@@ -1,4 +1,4 @@
-﻿# Copyright 2026 Rimantas Zukaitis
+# Copyright 2026 Rimantas Zukaitis
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,57 +23,56 @@ router = APIRouter(tags=["proxy"])
 
 
 @router.get("/proxy/status")
-def proxy_status():
-    from contextspy.api.main import create_app  # noqa: F401 – to get settings
-    import contextspy.api.main as _main
-    # Access settings from app state if available
-    settings = getattr(_main, "_cached_settings", None)
-    port = settings.proxy.port if settings else 8080
+def proxy_status(request: Request) -> dict:
+    settings = request.app.state.settings
     return {
         "running": runner.is_running(),
-        "port": port,
+        "port": settings.proxy.port,
         "cert_installed": cert_exists(),
     }
 
 
 @router.post("/proxy/start")
-def proxy_start():
+def proxy_start(request: Request) -> dict:
     if runner.is_running():
         return {"status": "already_running"}
-    import contextspy.api.main as _main
-    settings = getattr(_main, "_cached_settings", None)
-    if settings is None:
-        from contextspy.config import Settings
-        settings = Settings.load()
-    ws_manager = _main.get_ws_manager()
-    runner.start_proxy(settings, ws_manager)
+    runner.start_proxy(
+        request.app.state.settings,
+        request.app.state.provider_registry,
+        request.app.state.ws_manager,
+    )
     return {"status": "started"}
 
 
 @router.post("/proxy/stop")
-def proxy_stop():
+def proxy_stop() -> dict:
     runner.stop_proxy()
     return {"status": "stopped"}
 
 
 @router.post("/proxy/install-cert")
-def proxy_install_cert():
+def proxy_install_cert() -> dict:
     success, message = install_cert()
     return {"success": success, "message": message}
 
 
 @router.get("/proxy.pac", response_class=PlainTextResponse)
 def proxy_pac(request: Request) -> PlainTextResponse:
-    from contextspy.proxy.addon import _HOST_PROVIDER
-
     settings = request.app.state.settings
     proxy_host_port = f"127.0.0.1:{settings.proxy.port}"
 
-    lines = [
-        f'    if (shExpMatch(host, "{host}") || shExpMatch(host, "*.{host}")) '
-        f'return "PROXY {proxy_host_port}";'
-        for host, _ in _HOST_PROVIDER
-    ]
+    lines: list[str] = []
+    for route in request.app.state.provider_registry.pac_routes():
+        exact = f'shExpMatch(host, "{route.host}")'
+        if route.include_subdomains:
+            condition = (
+                f'{exact} || shExpMatch(host, "*.{route.host}")'
+            )
+        else:
+            condition = exact
+        lines.append(
+            f'    if ({condition}) return "PROXY {proxy_host_port}";'
+        )
     body = "\n".join(lines)
     content = (
         f'function FindProxyForURL(url, host) {{\n{body}\n    return "DIRECT";\n}}\n'

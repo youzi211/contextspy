@@ -45,6 +45,7 @@ from contextspy.proxy.ws_protocols import CompletedExchange, WsSession, get_ws_p
 
 if TYPE_CHECKING:
     from contextspy.api.websocket import ConnectionManager
+    from contextspy.proxy.providers import ProviderRegistry, ProviderRoute
 
 logger = logging.getLogger(__name__)
 
@@ -192,20 +193,28 @@ class _DatabaseLineageRepository(InvocationLineageRepository):
 
 
 class ContextSpyAddon:
-    def __init__(self, provider_override: str | None = None) -> None:
+    def __init__(
+        self,
+        provider_registry: "ProviderRegistry",
+        fixed_route: "ProviderRoute | None" = None,
+    ) -> None:
         self.ws_manager: ConnectionManager | None = None
-        # When set, skip host-based detection and always use this provider.
-        # Used by reverse-proxy mode where the upstream is a known local server.
-        self._provider_override = provider_override
+        # When ``fixed_route`` is set, the addon trusts it (reverse mode where
+        # the upstream host doesn't identify the provider). Otherwise, the
+        # shared registry decides what the host/port means.
+        self._provider_registry = provider_registry
+        self._fixed_route = fixed_route
         # Keyed by flow.id — hooks run on the addon's own DumpMaster event loop
         # (single-threaded), so no locking is needed around this dict.
         self._ws_flows: dict[str, _WsFlowState] = {}
         self._lineage = _DatabaseLineageRepository()
 
+    def _route_for(self, host: str, port: int) -> "ProviderRoute | None":
+        return self._fixed_route or self._provider_registry.match(host, port)
+
     def _get_provider(self, host: str, port: int) -> str | None:
-        if self._provider_override is not None:
-            return self._provider_override
-        return _detect_provider(host, port)
+        route = self._route_for(host, port)
+        return route.provider if route is not None else None
 
     @staticmethod
     def _response_document(

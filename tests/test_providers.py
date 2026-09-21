@@ -1927,7 +1927,8 @@ class TestHandleWsExchange:
             endpoint="/backend-api/codex/responses",
         )
 
-        addon = ContextSpyAddon()
+        from contextspy.proxy.providers import build_provider_registry
+        addon = ContextSpyAddon(provider_registry=build_provider_registry([]))
         addon._handle_ws_exchange(state, exchange)
 
         with get_db() as db:
@@ -2004,7 +2005,14 @@ class TestAddonCaptureBoundaries:
             response_text='data: {"type":"future.event","value":7}\n\ndata: [DONE]\n\n',
         )
 
-        addon_module.ContextSpyAddon(provider_override="openai")._handle_response(flow)
+        from contextspy.proxy.providers import ProviderRoute, build_provider_registry
+        fixed = ProviderRoute(
+            host=None, provider="openai", include_subdomains=False,
+            allowed_protocols=None, source="reverse_target",
+        )
+        addon_module.ContextSpyAddon(
+            provider_registry=build_provider_registry([]), fixed_route=fixed,
+        )._handle_response(flow)
 
         with get_db() as db:
             rows = crud.list_requests(db)
@@ -2033,7 +2041,14 @@ class TestAddonCaptureBoundaries:
             request_text=request_text,
             error="connection reset before response",
         )
-        addon = ContextSpyAddon(provider_override="openai")
+        from contextspy.proxy.providers import ProviderRoute, build_provider_registry
+        fixed = ProviderRoute(
+            host=None, provider="openai", include_subdomains=False,
+            allowed_protocols=None, source="reverse_target",
+        )
+        addon = ContextSpyAddon(
+            provider_registry=build_provider_registry([]), fixed_route=fixed,
+        )
         addon.error(flow)
         addon.error(flow)
 
