@@ -280,3 +280,23 @@ def test_proxy_pac_uses_registry_and_respects_subdomain_flag(tmp_path: Path):
     assert 'shExpMatch(host, "api.openai.com")' in body
     assert "11434" not in body
     assert 'return "PROXY 127.0.0.1:9999"' in body
+
+
+# ---------------------------------------------------------------------------
+# Default config template (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def test_default_config_documents_provider_routes_and_removes_legacy_section(tmp_path: Path):
+    settings = Settings(config_dir=tmp_path)
+    settings.storage.db_path = tmp_path / "contextspy.db"
+    settings.write_defaults()
+    text = (tmp_path / "config.toml").read_text(encoding="utf-8")
+    assert "# [[provider_routes]]" in text
+    assert '# host = "gateway.example.com"' in text
+    assert '# provider = "enterprise_gateway"' in text
+    assert "# include_subdomains = false" in text
+    assert "# allowed_protocols = [" in text
+    assert "[intercepted_hosts]" not in text
+    assert "extra_hosts" not in text
+    assert Settings.load(tmp_path / "config.toml").provider_routes == []

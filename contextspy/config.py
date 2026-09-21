@@ -206,9 +206,20 @@ db_path = "{db_path_toml}"
 raw_body_days = {self.retention.raw_body_days}
 block_content_days = {self.retention.block_content_days}
 
-[intercepted_hosts]
-# Add extra hosts if needed (besides the built-in list)
-extra_hosts = []
+# Add a cloud gateway without rebuilding ContextSpy. Host must be a bare
+# hostname (no scheme, port, path, or wildcard). Omit allowed_protocols to
+# allow every registered protocol; set it to limit the captured wire formats.
+# Built-in providers (api.openai.com, api.anthropic.com, chatgpt.com, …) are
+# already covered — only add entries for custom / enterprise hosts.
+# [[provider_routes]]
+# host = "gateway.example.com"
+# provider = "enterprise_gateway"
+# include_subdomains = false
+# allowed_protocols = [
+#   "openai_chat",
+#   "openai_responses",
+#   "anthropic",
+# ]
 
 # Uncomment and edit to enable local reverse-proxy mode.
 # Each [[reverse_targets]] block defines one local LLM server to intercept.
