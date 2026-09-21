@@ -80,7 +80,7 @@ ContextSpy operates in two complementary modes:
 ┌──────────────────────────────────────────────────────────────┐
 │  ContextSpy Reverse Proxy (mitmproxy, 127.0.0.1:8889)        │
 │  mode = reverse:http://127.0.0.1:8080                        │
-│  • provider_override supplies the stored provider label      │
+│  • A fixed ProviderRoute supplies the stored provider label  │
 │  • endpoint path selects the wire-format adapter             │
 │  • Normalizes supported HTTP invocations                     │
 │  • Writes records to SQLite                                  │
@@ -136,44 +136,50 @@ Both modes share the same database, web server, and dashboard. The proxy addon a
 
 #### Hostname Filter
 
-Only analyze and store flows attributed to the following hosts/ports. Other proxy traffic is
-forwarded without a ContextSpy record:
+The startup-built `ProviderRegistry` is the single source of truth for proxy admission and PAC
+generation. It combines these built-in routes with validated `[[provider_routes]]` entries from
+the configuration file. Only analyze and store flows attributed to a matching route; other proxy
+traffic is forwarded without a ContextSpy record:
 
 | Hostname pattern | Provider |
 |---|---|
-| `api.openai.com` | `openai` |
+| `api.openai.com` and subdomains | `openai` |
 | `openai.azure.com` and subdomains | `openai_azure` |
-| `api.anthropic.com` | `anthropic` |
+| `api.anthropic.com` and subdomains | `anthropic` |
 | `copilot-proxy.githubusercontent.com`, `githubcopilot.com` and subdomains | `copilot` |
 | `opencode.ai`, `*.opencode.ai` | `opencode_zen` |
 | `chatgpt.com`, `*.chatgpt.com` | `openai_chatgpt` |
 | any host on port `11434` | `ollama` |
 
+Hostnames are normalized to lowercase without a trailing root dot. Port routes win, followed by
+exact hostname matches and then the longest matching route with `include_subdomains = true`.
+
 #### Addon Class: `ContextSpyAddon`
 
-Accepts an optional `provider_override: str | None` constructor argument. When set, the addon skips hostname-based provider detection and always uses the specified provider string. Used by reverse-proxy mode where the upstream is a known local server.
+Accepts a shared `ProviderRegistry` and an optional fixed `ProviderRoute`. Reverse-proxy mode uses
+the fixed route because the upstream hostname does not identify the provider; forward mode asks
+the registry to match the destination hostname and port.
 
 The addon handles regular JSON, SSE/NDJSON streams, transport failures, and registered WebSocket
-protocols. Request bodies are captured before forwarding so a connection failure can still
-produce an inspectable request row. Host detection first selects a provider label; endpoint
-matching then selects the wire-format adapter and prevents unrelated telemetry/auth traffic on a
-known host from being stored. Stream framing is decoded separately from provider reconstruction
-and analysis:
+protocols. Route, endpoint, and protocol admission happens before any body read. For admitted
+flows, request bodies are captured before forwarding so a connection failure can still produce
+an inspectable request row. Stream framing is decoded separately from provider reconstruction and
+analysis:
 
 ```
 class ContextSpyAddon:
-    def __init__(self, provider_override=None):
-        ...
-    def _get_provider(self, host, port):
-        if self._provider_override:
-            return self._provider_override
-        return _detect_provider(host, port)
+    def __init__(self, provider_registry, fixed_route=None):
+        self._provider_registry = provider_registry
+        self._fixed_route = fixed_route
 
     def request(self, flow):
-        flow.metadata["ts_start"] = time.monotonic()
-        # Retain the decoded application request body for success/error paths.
+        # 1. Resolve the fixed route or match host + port in ProviderRegistry
+        # 2. Select an adapter from the endpoint path
+        # 3. Enforce the route's allowed_protocols policy
+        # 4. Only then retain the request body and admission metadata
 
     def responseheaders(self, flow):
+        # Reuse request-time admission metadata; rejected flows stay unread.
         # For text/event-stream responses, attach a streaming callback
         # that collects SSE chunks. When the stream ends (empty bytes
         # sentinel), decode complete SSE records, reconstruct canonical provider
@@ -183,14 +189,13 @@ class ContextSpyAddon:
     def response(self, flow):
         # Skipped if is_sse is set (handled by stream callback).
         # Otherwise:
-        # 1. Detect provider from hostname/port; skip unknown providers
+        # 1. Reuse the route + adapter admitted by request()
         # 2. Extract request/response application payloads
-        # 3. Select an adapter from the endpoint path
-        # 4. Detect agent from User-Agent
-        # 5. Reconstruct SSE-like/NDJSON response JSON when needed
-        # 6. Normalize provider state and analyze the canonical JSON
-        # 7. Persist the request, blocks, usage, and transport diagnostics
-        # 8. Emit a WebSocket event for live UI update
+        # 3. Detect agent from User-Agent
+        # 4. Reconstruct SSE-like/NDJSON response JSON when needed
+        # 5. Normalize provider state and analyze the canonical JSON
+        # 6. Persist the request, blocks, usage, and transport diagnostics
+        # 7. Emit a WebSocket event for live UI update
 
     def websocket_start(self, flow):
         # Attach a registered per-connection protocol session.
@@ -221,7 +226,7 @@ class ContextSpyAddon:
 **Technology:** `mitmproxy` `DumpMaster` in `reverse:` mode — one instance per `[[reverse_targets]]` entry.  
 **Ports:** Configured per-target in `config.toml` (e.g. `8889`, `8890`).  
 **TLS:** None — the upstream is plain HTTP on localhost.  
-**Provider detection:** Bypassed — `provider_override` supplies the stored provider label and
+**Provider detection:** Bypassed — a fixed `ProviderRoute` supplies the stored provider label and
 allows the local flow through the provider gate. The request path still selects the adapter.
 
 Each reverse target is described by:
@@ -231,11 +236,15 @@ Each reverse target is described by:
 | `name` | str | Human label (e.g. `"llama-server"`) |
 | `listen_port` | int | Port contextspy binds (e.g. `8889`) |
 | `target_url` | str | Upstream URL (e.g. `"http://127.0.0.1:8080"`) |
-| `provider` | str | Provider label stored on captures; defaults to `"openai"` and may be set to `"anthropic"` or `"ollama"` |
+| `provider` | str | Provider label stored on captures; defaults to `"openai"` |
 
-All three local server types expose an OpenAI-compatible `/v1/chat/completions` endpoint, so `provider = "openai"` is the correct choice for llama-server, Ollama (`/v1` endpoint, requires Ollama ≥ 0.1.24), and vLLM.
+The request path, not `provider`, selects the adapter. The default label is `"openai"` because all
+three local server types expose an OpenAI-compatible `/v1/chat/completions` endpoint: llama-server,
+Ollama (`/v1` endpoint, requires Ollama ≥ 0.1.24), and vLLM.
 
-`start_local_proxies(settings, ws_manager)` in `contextspy/proxy/runner.py` iterates over `settings.reverse_targets` and spawns one daemon thread per target. `stop_local_proxies()` shuts them all down cleanly.
+`start_local_proxies(settings, registry, ws_manager)` in `contextspy/proxy/runner.py` iterates over
+`settings.reverse_targets` and spawns one daemon thread per target. `stop_local_proxies()` shuts
+them all down cleanly.
 
 ---
 
@@ -287,16 +296,15 @@ match wins:
 | `ollama.py` | `ollama` | `/api/chat`, `/api/generate` |
 
 Adapters are registered in this order in `analysis/adapters/__init__.py`; order matters where
-patterns could otherwise overlap. There is no adapter per *provider* — OpenAI-compatible
-providers (Azure OpenAI, GitHub Copilot, opencode's cloud API) are detected separately by host
-(`proxy/addon.py`'s `_HOST_PROVIDER`, used only to label `provider`/`agent` on the stored
-request) but parsed by the same `openai_chat`/`openai_responses` adapter, since they speak the
-same wire format. Adding a genuinely new wire format is a new adapter module and a `register()`
-call — nothing else in the pipeline changes.
+patterns could otherwise overlap. There is no adapter per *provider* — `proxy/providers.py`'s
+`ProviderRegistry` selects the stored provider label separately from endpoint-based adapter
+selection. OpenAI-compatible providers (Azure OpenAI, GitHub Copilot, opencode's cloud API) are
+therefore parsed by the same `openai_chat`/`openai_responses` adapter. Adding a genuinely new wire
+format is a new adapter module and a `register()` call — nothing else in the pipeline changes.
 
-Requests to unrecognised endpoints (`get_adapter` returns `None`) are normally skipped. If the
-path still resembles a supported LLM endpoint, the transport evidence is retained with no block
-rows and zero local token totals so parser/capture failures remain inspectable.
+Requests to unrecognised endpoints (`get_adapter` returns `None`) are skipped before body reads or
+persistence. Once a supported endpoint is admitted, transport and parser failures remain
+inspectable through the stored request and capture diagnostics.
 
 #### Canonical invocation normalization
 
@@ -921,14 +929,14 @@ contextspy --version
 
 ### Provider Detection
 
-Determined from the destination hostname/port of the intercepted flow. Host patterns match the
-exact hostname and all subdomains:
+Determined from the destination hostname/port of the intercepted flow by the startup-built
+`ProviderRegistry`. Built-in routes are:
 
 | Hostname | Provider value |
 |---|---|
-| `api.openai.com` | `openai` |
+| `api.openai.com` and subdomains | `openai` |
 | `openai.azure.com` and subdomains | `openai_azure` |
-| `api.anthropic.com` | `anthropic` |
+| `api.anthropic.com` and subdomains | `anthropic` |
 | `copilot-proxy.githubusercontent.com` | `copilot` |
 | `githubcopilot.com` and subdomains | `copilot` |
 | `opencode.ai` and subdomains | `opencode_zen` |
@@ -936,9 +944,14 @@ exact hostname and all subdomains:
 | any hostname on port `11434` | `ollama` |
 | anything else | not captured |
 
-A recognized host is not sufficient by itself: only requests parsed by an adapter, or requests
-whose path resembles a supported LLM endpoint, are persisted. This is especially important for
-broad hosts such as `chatgpt.com`, which also carry telemetry and account traffic.
+Configured `[[provider_routes]]` add exact hostname matches and may opt into subdomain matching.
+Matching checks a port route first, then an exact hostname, then the longest matching subdomain
+route. Hostnames are compared case-insensitively and a trailing root dot is ignored.
+
+A recognized host is not sufficient by itself. The request path must select a registered adapter,
+and that adapter's protocol must be allowed by the route. Only after all three checks does
+ContextSpy read request or response bodies. This is especially important for broad hosts such as
+`chatgpt.com`, which also carry telemetry and account traffic.
 
 ### Agent Detection
 
@@ -1172,10 +1185,14 @@ db_path = "~/.contextspy/contextspy.db"
 raw_body_days = 7
 block_content_days = 7
 
-[intercepted_hosts]
-# Reserved setting. It is parsed into Settings.extra_hosts but is not yet
-# consulted by provider detection or PAC generation.
-extra_hosts = []
+# Add a cloud gateway without rebuilding ContextSpy. Host must be a bare
+# hostname (no scheme, port, path, or wildcard). Omit allowed_protocols to
+# allow every registered protocol; set it to a non-empty list to restrict it.
+# [[provider_routes]]
+# host = "gateway.example.com"
+# provider = "enterprise_gateway"
+# include_subdomains = false
+# allowed_protocols = ["openai_chat", "openai_responses", "anthropic"]
 
 # Each [[reverse_targets]] block defines one local LLM server to intercept
 # in reverse-proxy mode (used by 'contextspy start-local').
@@ -1189,8 +1206,10 @@ extra_hosts = []
 The `config.py` module loads this file and exposes a `Settings` object. `contextspy start` applies
 its `--proxy-port` and `--web-port` values after loading the file (their defaults are `8888` and
 `5173`); `start-local` applies `--web-port` and reads listener/upstream ports from
-`[[reverse_targets]]`. Bind addresses, storage, retention, and reverse-target definitions remain
-configuration-file values. `extra_hosts` is currently reserved and does not extend capture.
+`[[reverse_targets]]`. Bind addresses, storage, retention, provider routes, and reverse-target
+definitions remain configuration-file values. A non-empty legacy
+`[intercepted_hosts].extra_hosts` value is rejected at startup; migrate each entry to
+`[[provider_routes]]` and set an explicit provider label.
 
 > **Windows note:** When writing the config file, `db_path` backslashes are converted to forward slashes before serialisation. Raw Windows paths (e.g. `C:\Users\...`) would cause `TOMLDecodeError` because TOML interprets `\U` and `\u` as Unicode escapes in double-quoted strings.
 
@@ -1202,8 +1221,8 @@ configuration-file values. `extra_hosts` is currently reserved and does not exte
 
 When `contextspy start` is called:
 
-1. Load config, apply the CLI port values, ensure directories, and create the default config file
-   if it does not exist.
+1. Load config, apply the CLI port values, ensure directories, create the default config file if it
+   does not exist, and build the validated provider registry once.
 2. Initialise the SQLite schema/additive columns and check for pending data migrations. If any are
    pending, print an error pointing at `db-upgrade`/`reset-db` and exit before starting services.
 3. Validate or generate the mitmproxy CA. A newly generated CA triggers one automatic trust-store
@@ -1211,21 +1230,22 @@ When `contextspy start` is called:
 4. Create the FastAPI application and start Uvicorn on the configured web bind address/port. Unless
    `--no-browser` is set, schedule the dashboard to open after a short delay.
 5. During the FastAPI lifespan startup, initialise the DB again, run the one-time retention vacuum,
-   and start mitmproxy `DumpMaster` with `ContextSpyAddon` in a daemon thread.
+   and start mitmproxy `DumpMaster` with `ContextSpyAddon` in a daemon thread. The same registry is
+   shared by the addon and `/api/proxy.pac` generation.
 6. On shutdown, stop/join the proxy thread and dispose the DB engine.
 
 ### 11.2 Local Mode (`contextspy start-local`)
 
 When `contextspy start-local` is called:
 
-1. Load config, apply the CLI web-port value, ensure directories, create defaults if needed, and run
-   the same schema/pending-migration check as cloud mode.
+1. Load config, apply the CLI web-port value, ensure directories, create defaults if needed, build
+   the provider registry, and run the same schema/pending-migration check as cloud mode.
 2. Abort with a configuration example if `reverse_targets` is empty.
 3. Skip CA generation/installation, create the local FastAPI application, and start Uvicorn. Unless
    `--no-browser` is set, schedule the dashboard to open after a short delay.
 4. During FastAPI lifespan startup, initialise the DB again, run the one-time retention vacuum, and
    start one staggered daemon-thread `DumpMaster` per `[[reverse_targets]]` entry in `reverse:` mode
-   with `ContextSpyAddon(provider_override=target.provider)`.
+   with a fixed `ProviderRoute` carrying `target.provider` as its stored label.
 5. On shutdown, stop/join all reverse-proxy threads and dispose the DB engine.
 
 ---

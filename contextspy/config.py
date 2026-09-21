@@ -70,7 +70,7 @@ class ReverseTarget:
     name: str                   # human label, e.g. "llama-server"
     listen_port: int            # port contextspy listens on, e.g. 8889
     target_url: str             # upstream URL, e.g. "http://127.0.0.1:8080"
-    provider: str = "openai"    # parser to use: "openai" | "anthropic" | "ollama"
+    provider: str = "openai"    # stored label; request path selects the adapter
 
 
 @dataclass
@@ -227,7 +227,7 @@ block_content_days = {self.retention.block_content_days}
 # name        = "llama-server"   # display label
 # listen_port = 8889             # port contextspy listens on
 # target_url  = "http://127.0.0.1:8080"  # where your server actually runs
-# provider    = "openai"         # parser: "openai" | "anthropic" | "ollama"
+# provider    = "openai"         # stored label; request path selects the adapter
 """,
                 encoding="utf-8",
             )
