@@ -36,9 +36,11 @@ def get_ws_manager() -> ConnectionManager:
 
 def create_app(settings=None) -> FastAPI:
     from contextspy.config import Settings
+    from contextspy.proxy.providers import build_provider_registry
 
     if settings is None:
         settings = Settings.load()
+    provider_registry = build_provider_registry(settings.provider_routes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -49,7 +51,7 @@ def create_app(settings=None) -> FastAPI:
         startup_vacuum(settings)
         # Start proxy
         from contextspy.proxy.runner import start_proxy
-        start_proxy(settings, _ws_manager)
+        start_proxy(settings, provider_registry, _ws_manager)
         yield
         # Shutdown
         from contextspy.proxy.runner import stop_proxy
@@ -59,6 +61,7 @@ def create_app(settings=None) -> FastAPI:
     app = FastAPI(title="ContextSpy", lifespan=lifespan)
     app.state.settings = settings
     app.state.ws_manager = _ws_manager
+    app.state.provider_registry = provider_registry
 
     # Routers
     from contextspy.api.routers import proxy as proxy_router
@@ -106,9 +109,11 @@ def create_app_local(settings=None) -> FastAPI:
     interception is needed when the upstream is a plain-HTTP localhost server.
     """
     from contextspy.config import Settings
+    from contextspy.proxy.providers import build_provider_registry
 
     if settings is None:
         settings = Settings.load()
+    provider_registry = build_provider_registry(settings.provider_routes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -117,7 +122,7 @@ def create_app_local(settings=None) -> FastAPI:
         init_db(settings.storage.db_path)
         startup_vacuum(settings)
         from contextspy.proxy.runner import start_local_proxies
-        start_local_proxies(settings, _ws_manager)
+        start_local_proxies(settings, provider_registry, _ws_manager)
         yield
         from contextspy.proxy.runner import stop_local_proxies
         stop_local_proxies()
@@ -126,6 +131,7 @@ def create_app_local(settings=None) -> FastAPI:
     app = FastAPI(title="ContextSpy (local)", lifespan=lifespan)
     app.state.settings = settings
     app.state.ws_manager = _ws_manager
+    app.state.provider_registry = provider_registry
 
     from contextspy.api.routers import proxy as proxy_router
     from contextspy.api.routers import requests as requests_router

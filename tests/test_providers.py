@@ -35,6 +35,7 @@ from contextspy.analysis.blocks import AnalyzedRequest, BlockType, Direction, Us
 from contextspy.analysis.capture import CapturedEvent, decode_sse
 from contextspy.analysis.classifier import classify, classify_blocks, per_tool_tokens
 from contextspy.analysis.tokenizer import count_tokens
+from contextspy.config import ProviderRouteSettings
 
 
 def _parse_stream(adapter, raw: bytes):
@@ -46,7 +47,7 @@ def _json_sse_payloads(raw: bytes) -> list[dict]:
     return [event.payload for event in decode_sse(raw) if isinstance(event.payload, dict)]
 
 try:
-    from contextspy.proxy.addon import _detect_agent, _detect_provider
+    from contextspy.proxy.addon import _detect_agent
     _HAS_ADDON = True
 except ImportError:
     _HAS_ADDON = False
@@ -1818,48 +1819,67 @@ class TestTransportColumn:
 
 @pytest.mark.skipif(not _HAS_ADDON, reason="mitmproxy not installed")
 class TestProviderDetection:
-    """Guards against accidentally breaking host→provider routing when adding new entries."""
+    """Guards against accidentally breaking host→provider routing when adding new entries.
+
+    Routing now lives in ``ProviderRegistry``; the legacy ``_detect_provider``
+    helper is removed. These checks keep the legacy table and the registry
+    in lockstep until the historic detection test surface is migrated.
+    """
+
+    def _match(self, host: str, port: int) -> str | None:
+        from contextspy.proxy.providers import build_provider_registry
+
+        registry = build_provider_registry([
+            ProviderRouteSettings(
+                host="aiagent.lakala.com",
+                provider="openai",
+                include_subdomains=True,
+                allowed_protocols=("openai_chat", "openai_responses"),
+            ),
+        ])
+        route = registry.match(host, port)
+        return None if route is None else route.provider
 
     def test_claude_code(self):
-        assert _detect_provider("api.anthropic.com", 443) == "anthropic"
+        assert self._match("api.anthropic.com", 443) == "anthropic"
 
     def test_anthropic_subdomain(self):
-        assert _detect_provider("bedrock.api.anthropic.com", 443) == "anthropic"
+        assert self._match("bedrock.api.anthropic.com", 443) == "anthropic"
 
     def test_openai_direct(self):
-        assert _detect_provider("api.openai.com", 443) == "openai"
+        assert self._match("api.openai.com", 443) == "openai"
 
     def test_azure_openai(self):
-        assert _detect_provider("myinstance.openai.azure.com", 443) == "openai_azure"
+        assert self._match("myinstance.openai.azure.com", 443) == "openai_azure"
 
     def test_copilot_legacy_proxy(self):
-        assert _detect_provider("copilot-proxy.githubusercontent.com", 443) == "copilot"
+        assert self._match("copilot-proxy.githubusercontent.com", 443) == "copilot"
 
     def test_copilot_api_subdomain(self):
-        assert _detect_provider("api.githubcopilot.com", 443) == "copilot"
+        assert self._match("api.githubcopilot.com", 443) == "copilot"
 
     def test_opencode_zen_gateway(self):
-        assert _detect_provider("opencode.ai", 443) == "opencode_zen"
+        assert self._match("opencode.ai", 443) == "opencode_zen"
 
     def test_opencode_zen_subdomain(self):
-        assert _detect_provider("api.opencode.ai", 443) == "opencode_zen"
+        assert self._match("api.opencode.ai", 443) == "opencode_zen"
 
     def test_ollama_port(self):
-        assert _detect_provider("localhost", 11434) == "ollama"
-        assert _detect_provider("127.0.0.1", 11434) == "ollama"
+        assert self._match("localhost", 11434) == "ollama"
+        assert self._match("127.0.0.1", 11434) == "ollama"
 
     def test_custom_openai_gateway(self):
-        assert _detect_provider("aiagent.lakala.com", 443) == "openai"
+        assert self._match("aiagent.lakala.com", 443) == "openai"
 
     def test_custom_openai_gateway_subdomain(self):
-        assert _detect_provider("api.aiagent.lakala.com", 443) == "openai"
+        assert self._match("api.aiagent.lakala.com", 443) == "openai"
 
     def test_unknown_host_returns_none(self):
-        assert _detect_provider("example.com", 443) is None
+        assert self._match("example.com", 443) is None
 
     def test_telemetry_hosts_return_none(self):
-        assert _detect_provider("eu-central-1-1.aws.cloud2.influxdata.com", 443) is None
-        assert _detect_provider("models.dev", 443) is None
+        assert self._match("eu-central-1-1.aws.cloud2.influxdata.com", 443) is None
+        assert self._match("models.dev", 443) is None
 
 
 @pytest.mark.skipif(not _HAS_ADDON, reason="mitmproxy not installed")
@@ -1927,7 +1947,8 @@ class TestHandleWsExchange:
             endpoint="/backend-api/codex/responses",
         )
 
-        addon = ContextSpyAddon()
+        from contextspy.proxy.providers import build_provider_registry
+        addon = ContextSpyAddon(provider_registry=build_provider_registry([]))
         addon._handle_ws_exchange(state, exchange)
 
         with get_db() as db:
@@ -1952,25 +1973,162 @@ class TestHandleWsExchange:
 @pytest.mark.skipif(not _HAS_ADDON, reason="mitmproxy not installed")
 class TestAddonCaptureBoundaries:
     @staticmethod
-    def _flow(*, request_text: str, response_text: str | None = None, error=None):
+    def _flow(
+        *,
+        request_text: str | None = None,
+        response_text: str | None = None,
+        host: str = "api.openai.com",
+        port: int = 443,
+        path: str = "/v1/responses",
+        content_type: str = "application/json",
+        error=None,
+        request_reader=None,
+        response_reader=None,
+    ):
         from types import SimpleNamespace
 
         request = SimpleNamespace(
-            pretty_host="api.openai.com",
-            port=443,
-            path="/v1/responses",
+            pretty_host=host,
+            port=port,
+            path=path,
             headers={"user-agent": "test"},
-            get_text=lambda: request_text,
+            get_text=request_reader or (lambda: request_text or ""),
         )
-        response = None if response_text is None else SimpleNamespace(
-            status_code=200,
-            headers={"content-type": "application/octet-stream"},
-            get_text=lambda: response_text,
-        )
+        response = None
+        if response_text is not None or response_reader is not None:
+            response = SimpleNamespace(
+                status_code=200,
+                headers={"content-type": content_type},
+                get_text=response_reader or (lambda: response_text or ""),
+                stream=None,
+            )
         return SimpleNamespace(
-            id="flow-1", request=request, response=response, websocket=None,
-            metadata={"contextspy_request_body": request_text}, error=error,
+            id="flow-1",
+            request=request,
+            response=response,
+            websocket=None,
+            metadata={},
+            error=error,
         )
+
+    @pytest.mark.parametrize(
+        ("host", "path", "routes", "expected_status"),
+        [
+            ("unknown.example.com", "/v1/responses", [], "provider_route_not_found"),
+            ("api.openai.com", "/telemetry", [], "provider_endpoint_not_supported"),
+            (
+                "limited.example.com",
+                "/v1/responses",
+                [ProviderRouteSettings(
+                    host="limited.example.com",
+                    provider="limited",
+                    allowed_protocols=("anthropic",),
+                )],
+                "provider_protocol_not_allowed",
+            ),
+        ],
+    )
+    def test_rejected_http_flow_never_reads_bodies_or_saves(
+        self, host, path, routes, expected_status,
+    ):
+        from unittest.mock import Mock
+
+        from contextspy.config import ProviderRouteSettings
+        from contextspy.proxy.addon import ContextSpyAddon
+        from contextspy.proxy.providers import build_provider_registry
+
+        reads = {"request": 0, "response": 0}
+
+        def request_reader():
+            reads["request"] += 1
+            return '{"model":"secret"}'
+
+        def response_reader():
+            reads["response"] += 1
+            return '{"id":"secret"}'
+
+        flow = self._flow(
+            host=host,
+            path=path,
+            request_reader=request_reader,
+            response_reader=response_reader,
+            error="upstream failed",
+        )
+        addon = ContextSpyAddon(build_provider_registry(routes))
+        save = Mock(wraps=addon._save_request)
+        addon._save_request = save  # type: ignore[method-assign]
+
+        addon.request(flow)
+        addon.response(flow)
+        addon.error(flow)
+
+        assert reads == {"request": 0, "response": 0}
+        assert flow.metadata["contextspy_capture_status"] == expected_status
+        assert save.call_count == 0
+
+    def test_response_reuses_request_admission_metadata(self, tmp_path):
+        from contextspy.db import crud
+        from contextspy.db.database import get_db, init_db
+        from contextspy.proxy.addon import ContextSpyAddon
+        from contextspy.proxy.providers import build_provider_registry
+
+        init_db(tmp_path / "stable-admission.db")
+        registry = build_provider_registry([ProviderRouteSettings(
+            host="aiagent.lakala.com",
+            provider="lakala_gateway",
+            include_subdomains=True,
+            allowed_protocols=("openai_chat", "openai_responses", "anthropic"),
+        )])
+        flow = self._flow(
+            host="aiagent.lakala.com",
+            path="/v1/responses",
+            request_text=json.dumps({"model": "gpt-test", "input": "hello"}),
+            response_text=json.dumps({
+                "id": "resp_1", "model": "gpt-test", "output": [], "usage": {},
+            }),
+            content_type="application/json",
+        )
+        addon = ContextSpyAddon(registry)
+        addon.request(flow)
+        # Test deliberately mutates the flow to verify handler stability.
+        flow.request.pretty_host = "unknown.example.com"
+        flow.request.path = "/telemetry"
+        addon.response(flow)
+
+        with get_db() as db:
+            rows = crud.list_requests(db)
+            assert len(rows) == 1
+            assert rows[0].provider == "lakala_gateway"
+            assert rows[0].endpoint == "/telemetry"
+
+    def test_responseheaders_installs_sse_collector_only_for_admitted_flow(self):
+        from contextspy.proxy.addon import ContextSpyAddon
+        from contextspy.proxy.providers import build_provider_registry
+
+        registry = build_provider_registry([])
+        allowed = self._flow(
+            host="api.openai.com",
+            path="/v1/responses",
+            request_text='{"model":"gpt-test","input":"hi"}',
+            response_text="",
+            content_type="text/event-stream",
+        )
+        denied = self._flow(
+            host="unknown.example.com",
+            path="/v1/responses",
+            request_text='{"secret":true}',
+            response_text="",
+            content_type="text/event-stream",
+        )
+        addon = ContextSpyAddon(registry)
+        addon.request(allowed)
+        addon.request(denied)
+        addon.responseheaders(allowed)
+        addon.responseheaders(denied)
+        assert callable(allowed.response.stream)
+        assert allowed.metadata["is_sse"] is True
+        assert denied.response.stream is None
+        assert "is_sse" not in denied.metadata
 
     def test_stream_capture_survives_both_analysis_failures(self, tmp_path, monkeypatch):
         from contextspy.analysis.capture import CanonicalResponse
@@ -2003,8 +2161,19 @@ class TestAddonCaptureBoundaries:
             request_text=json.dumps({"model": "gpt-test", "input": "hello"}),
             response_text='data: {"type":"future.event","value":7}\n\ndata: [DONE]\n\n',
         )
-
-        addon_module.ContextSpyAddon(provider_override="openai")._handle_response(flow)
+        # Prime admission with the patched (failing) adapter.
+        flow.metadata["contextspy_capture_status"] = "provider_route_matched"
+        flow.metadata["contextspy_provider"] = "openai"
+        from contextspy.proxy.providers import ProviderRoute, build_provider_registry
+        fixed = ProviderRoute(
+            host=None, provider="openai", include_subdomains=False,
+            allowed_protocols=None, source="reverse_target",
+        )
+        flow.metadata["contextspy_provider_route"] = fixed
+        flow.metadata["contextspy_adapter"] = FailingAnalysisAdapter()
+        addon_module.ContextSpyAddon(
+            provider_registry=build_provider_registry([]), fixed_route=fixed,
+        )._handle_response(flow)
 
         with get_db() as db:
             rows = crud.list_requests(db)
@@ -2033,7 +2202,15 @@ class TestAddonCaptureBoundaries:
             request_text=request_text,
             error="connection reset before response",
         )
-        addon = ContextSpyAddon(provider_override="openai")
+        from contextspy.proxy.providers import ProviderRoute, build_provider_registry
+        fixed = ProviderRoute(
+            host=None, provider="openai", include_subdomains=False,
+            allowed_protocols=None, source="reverse_target",
+        )
+        addon = ContextSpyAddon(
+            provider_registry=build_provider_registry([]), fixed_route=fixed,
+        )
+        addon.request(flow)
         addon.error(flow)
         addon.error(flow)
 

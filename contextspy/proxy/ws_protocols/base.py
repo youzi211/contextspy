@@ -55,6 +55,7 @@ class WsProtocol(ABC):
     """One WS-speaking provider: matches connections, hands out a session per one."""
 
     protocol_id: str
+    provider_protocol: str           # Adapter format_id that this WS layer produces
     host_patterns: tuple[str, ...]   # exact-or-suffix match (same rule as _detect_provider); () = any host
     path_patterns: tuple[str, ...]   # substring match, like adapter endpoint_patterns
 

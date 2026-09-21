@@ -25,6 +25,7 @@ import uuid
 from mitmproxy import http
 
 from contextspy.analysis.adapters import get_adapter
+from contextspy.analysis.adapters.base import WireFormatAdapter
 from contextspy.analysis.blocks import AnalyzedRequest
 from contextspy.analysis.capture import decode_ndjson, decode_sse
 from contextspy.analysis.classifier import CategoryBreakdown, classify, per_tool_tokens
@@ -41,50 +42,13 @@ from contextspy.normalization import (
     PersistedCanonicalInvocation,
     normalize_invocation,
 )
+from contextspy.proxy.providers import ProviderRegistry, ProviderRoute
 from contextspy.proxy.ws_protocols import CompletedExchange, WsSession, get_ws_protocol
 
 if TYPE_CHECKING:
     from contextspy.api.websocket import ConnectionManager
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Host → provider mapping
-# ---------------------------------------------------------------------------
-
-_HOST_PROVIDER: list[tuple[str, str]] = [
-    ("api.openai.com", "openai"),
-    ("openai.azure.com", "openai_azure"),
-    ("api.anthropic.com", "anthropic"),
-    # GitHub Copilot — covers both the legacy proxy host and the current API domain
-    # (*.githubcopilot.com catches api.githubcopilot.com, telemetry.githubcopilot.com, etc.)
-    ("copilot-proxy.githubusercontent.com", "copilot"),
-    ("githubcopilot.com", "copilot"),
-    # opencode's "zen" gateway relays to upstream models (e.g. Claude) over the
-    # Anthropic/OpenAI wire format. Dispatch is endpoint-based, so the gateway path
-    # (/zen/v1/messages, /zen/v1/chat/completions) is parsed by the right parser.
-    ("opencode.ai", "opencode_zen"),
-    # Codex CLI authenticated via a ChatGPT plan (rather than an OPENAI_API_KEY)
-    # sends its actual completions to the undocumented chatgpt.com/backend-api/codex/responses
-    # endpoint instead of api.openai.com. Host mapping is broad (chatgpt.com serves lots of
-    # non-LLM traffic — analytics-events, wham/usage, otlp/metrics) but that's fine: the
-    # endpoint-pattern gate in _save_request/get_adapter still filters those out.
-    ("chatgpt.com", "openai_chatgpt"),
-    # Custom OpenAI-compatible gateways (e.g. enterprise model gateways).
-    # Endpoint dispatch (/chat/completions substring) picks the correct adapter.
-    ("aiagent.lakala.com", "openai"),
-]
-_OLLAMA_PORTS = {11434}
-
-
-def _detect_provider(host: str, port: int) -> str | None:
-    if port in _OLLAMA_PORTS:
-        return "ollama"
-    for pattern, provider in _HOST_PROVIDER:
-        if host == pattern or host.endswith("." + pattern):
-            return provider
-    return None
-
 
 # ---------------------------------------------------------------------------
 # User-Agent → agent mapping
@@ -192,20 +156,28 @@ class _DatabaseLineageRepository(InvocationLineageRepository):
 
 
 class ContextSpyAddon:
-    def __init__(self, provider_override: str | None = None) -> None:
+    def __init__(
+        self,
+        provider_registry: "ProviderRegistry",
+        fixed_route: "ProviderRoute | None" = None,
+    ) -> None:
         self.ws_manager: ConnectionManager | None = None
-        # When set, skip host-based detection and always use this provider.
-        # Used by reverse-proxy mode where the upstream is a known local server.
-        self._provider_override = provider_override
+        # When ``fixed_route`` is set, the addon trusts it (reverse mode where
+        # the upstream host doesn't identify the provider). Otherwise, the
+        # shared registry decides what the host/port means.
+        self._provider_registry = provider_registry
+        self._fixed_route = fixed_route
         # Keyed by flow.id — hooks run on the addon's own DumpMaster event loop
         # (single-threaded), so no locking is needed around this dict.
         self._ws_flows: dict[str, _WsFlowState] = {}
         self._lineage = _DatabaseLineageRepository()
 
+    def _route_for(self, host: str, port: int) -> "ProviderRoute | None":
+        return self._fixed_route or self._provider_registry.match(host, port)
+
     def _get_provider(self, host: str, port: int) -> str | None:
-        if self._provider_override is not None:
-            return self._provider_override
-        return _detect_provider(host, port)
+        route = self._route_for(host, port)
+        return route.provider if route is not None else None
 
     @staticmethod
     def _response_document(
@@ -227,7 +199,7 @@ class ContextSpyAddon:
         self,
         *,
         provider: str,
-        endpoint: str,
+        adapter: "WireFormatAdapter | None",
         protocol_id: str,
         req_body: dict,
         raw_request_body: str | None,
@@ -238,7 +210,6 @@ class ContextSpyAddon:
         capture_error: dict | None,
     ) -> tuple[CanonicalInvocation | None, AnalyzedRequest | None, dict | None]:
         """Cross the transport boundary once, then analyze only canonical JSON."""
-        adapter = get_adapter(endpoint)
         if adapter is None:
             return None, None, capture_error
 
@@ -285,13 +256,76 @@ class ContextSpyAddon:
             )
         return canonical, analysis.analyzed, capture_error
 
+    @staticmethod
+    def _http_admission(
+        flow: http.HTTPFlow,
+    ) -> tuple[ProviderRoute, WireFormatAdapter] | None:
+        """Return the route + adapter that ``request()`` resolved for this flow.
+
+        ``None`` means the flow was rejected (route unknown, endpoint
+        unsupported, or protocol not allowed) — those flows must not be
+        re-matched and flow that explicitly opted out of capture (status
+        ``provider_route_not_found`` etc.) must skip body reads and persistence.
+        """
+        if flow.metadata.get("contextspy_capture_status") != "provider_route_matched":
+            return None
+        route = flow.metadata.get("contextspy_provider_route")
+        adapter = flow.metadata.get("contextspy_adapter")
+        if not isinstance(route, ProviderRoute) or adapter is None:
+            return None
+        return route, adapter
+
     def request(self, flow: http.HTTPFlow) -> None:
+        """Single admission gate for HTTP captures.
+
+        Decides host+port+path+protocol exactly once. All later hooks read the
+        answer via ``_http_admission()`` instead of re-matching — keeps the
+        privacy boundary in front of every body read and prevents drift if
+        mitmproxy mutates the flow before ``response()``/``error()``.
+        """
+        host = flow.request.pretty_host
+        path = flow.request.path
+        port = flow.request.port
+        route = self._route_for(host, port)
+        if route is None:
+            flow.metadata["contextspy_capture_status"] = "provider_route_not_found"
+            logger.debug("provider_route_not_found host=%s path=%s", host, path)
+            return
+
+        adapter = get_adapter(path)
+        if adapter is None:
+            flow.metadata["contextspy_capture_status"] = "provider_endpoint_not_supported"
+            logger.debug(
+                "provider_endpoint_not_supported host=%s path=%s provider=%s source=%s",
+                host, path, route.provider, route.source,
+            )
+            return
+
+        if not self._provider_registry.is_protocol_allowed(route, adapter.format_id):
+            flow.metadata["contextspy_capture_status"] = "provider_protocol_not_allowed"
+            logger.warning(
+                "provider_protocol_not_allowed host=%s path=%s provider=%s "
+                "protocol=%s source=%s",
+                host, path, route.provider, adapter.format_id, route.source,
+            )
+            return
+
         flow.metadata["ts_start"] = time.monotonic()
+        flow.metadata.update({
+            "contextspy_capture_status": "provider_route_matched",
+            "contextspy_provider_route": route,
+            "contextspy_provider": route.provider,
+            "contextspy_provider_protocol": adapter.format_id,
+            "contextspy_adapter": adapter,
+        })
         try:
             flow.metadata["contextspy_request_body"] = flow.request.get_text()
         except Exception as exc:
             flow.metadata["contextspy_request_capture_error"] = str(exc)
-        logger.debug("HOOK request: %s %s", flow.request.pretty_host, flow.request.path[:60])
+        logger.debug(
+            "provider_route_matched host=%s path=%s provider=%s protocol=%s source=%s",
+            host, path, route.provider, adapter.format_id, route.source,
+        )
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         if flow.response is None:
@@ -305,10 +339,8 @@ class ContextSpyAddon:
         if "text/event-stream" not in ct:
             return
         # SSE streaming response — buffer all chunks, process when stream ends
-        host = flow.request.pretty_host
-        port = flow.request.port
-        if self._get_provider(host, port) is None:
-            return  # not an LLM host — skip overhead
+        if self._http_admission(flow) is None:
+            return  # not an admitted flow — skip overhead
 
         sse_chunks: list[bytes] = []
         addon = self
@@ -343,6 +375,12 @@ class ContextSpyAddon:
             logger.warning("ContextSpyAddon error: %s", exc, exc_info=True)
 
     def _handle_sse_response(self, flow: http.HTTPFlow, raw_sse: bytes) -> None:
+        admission = self._http_admission(flow)
+        if admission is None or flow.response is None:
+            return
+        route, adapter = admission
+        provider = route.provider
+
         # Decompress if the response was content-encoded
         if flow.response:
             encoding = flow.response.headers.get("content-encoding", "").lower()
@@ -366,12 +404,6 @@ class ContextSpyAddon:
                     raw_sse = brotli.decompress(raw_sse)
                 except Exception:
                     pass
-
-        host = flow.request.pretty_host
-        port = flow.request.port
-        provider = self._get_provider(host, port)
-        if provider is None:
-            return
 
         endpoint = flow.request.path
         user_agent = flow.request.headers.get("user-agent", "")
@@ -398,7 +430,6 @@ class ContextSpyAddon:
         if "ts_start" in flow.metadata and "ts_first_chunk" in flow.metadata:
             ttft_ms = int((flow.metadata["ts_first_chunk"] - flow.metadata["ts_start"]) * 1000)
 
-        adapter = get_adapter(endpoint)
         analyzed: AnalyzedRequest | None = None
         response_events: str | None = None
         response_reconstructed = False
@@ -419,22 +450,21 @@ class ContextSpyAddon:
                 [event.to_dict() for event in events], ensure_ascii=False,
             )
         canonical_payload: dict | None = None
-        if adapter is not None:
-            try:
-                canonical = adapter.reconstruct_response(events, transport="sse")
-                canonical_payload = canonical.payload
-                raw_resp_text = json.dumps(canonical.payload, ensure_ascii=False)
-                response_reconstructed = canonical.reconstructed
-                response_complete = canonical.complete
-            except Exception as exc:
-                logger.warning("Adapter reconstruction error (sse): %s", exc, exc_info=True)
-                response_complete = False
-                capture_error = _add_capture_error(capture_error, "sse_reconstruction", exc)
+        try:
+            canonical = adapter.reconstruct_response(events, transport="sse")
+            canonical_payload = canonical.payload
+            raw_resp_text = json.dumps(canonical.payload, ensure_ascii=False)
+            response_reconstructed = canonical.reconstructed
+            response_complete = canonical.complete
+        except Exception as exc:
+            logger.warning("Adapter reconstruction error (sse): %s", exc, exc_info=True)
+            response_complete = False
+            capture_error = _add_capture_error(capture_error, "sse_reconstruction", exc)
 
         status_code = flow.response.status_code if flow.response else None
         canonical_invocation, analyzed, capture_error = self._normalize_and_analyze(
             provider=provider,
-            endpoint=endpoint,
+            adapter=adapter,
             protocol_id="http_sse",
             req_body=req_body,
             raw_request_body=raw_request_body,
@@ -457,17 +487,16 @@ class ContextSpyAddon:
         flow.metadata["contextspy_saved"] = True
 
     def _handle_response(self, flow: http.HTTPFlow) -> None:
-        if flow.response is None:
+        admission = self._http_admission(flow)
+        if admission is None or flow.response is None:
             return
-        host = flow.request.pretty_host
-        port = flow.request.port
-        provider = self._get_provider(host, port)
+        route, adapter = admission
+        provider = route.provider
         logger.debug(
             "HOOK response: %s %s status=%s provider=%s",
-            host, flow.request.path[:60], flow.response.status_code, provider,
+            flow.request.pretty_host, flow.request.path[:60],
+            flow.response.status_code, provider,
         )
-        if provider is None:
-            return
 
         endpoint = flow.request.path
         user_agent = flow.request.headers.get("user-agent", "")
@@ -508,11 +537,9 @@ class ContextSpyAddon:
         if "ts_start" in flow.metadata:
             duration_ms = int((time.monotonic() - flow.metadata["ts_start"]) * 1000)
 
-        adapter = get_adapter(endpoint)
         content_type = flow.response.headers.get("content-type", "").lower()
         is_ndjson = bool(
-            adapter is not None
-            and adapter.stream_format == "ndjson"
+            adapter.stream_format == "ndjson"
             and (
                 "\n" in resp_text.strip()
                 or "application/x-ndjson" in content_type
@@ -521,7 +548,7 @@ class ContextSpyAddon:
         )
         logger.debug(
             "response body: len=%d is_sse=%s adapter=%s",
-            len(resp_text), is_sse, type(adapter).__name__ if adapter else None,
+            len(resp_text), is_sse, type(adapter).__name__,
         )
         analyzed: AnalyzedRequest | None = None
         response_events: str | None = None
@@ -550,22 +577,21 @@ class ContextSpyAddon:
                 response_events = json.dumps(
                     [event.to_dict() for event in events], ensure_ascii=False,
                 )
-            if adapter is not None:
-                try:
-                    canonical = adapter.reconstruct_response(
-                        events, transport="sse" if is_sse else "ndjson",
-                    )
-                    canonical_payload = canonical.payload
-                    raw_resp_text = json.dumps(canonical.payload, ensure_ascii=False)
-                    response_reconstructed = canonical.reconstructed
-                    response_complete = canonical.complete
-                except Exception as exc:
-                    logger.warning("Adapter response reconstruction error: %s", exc, exc_info=True)
-                    canonical_payload = None
-                    response_complete = False
-                    capture_error = _add_capture_error(
-                        capture_error, "response_reconstruction", exc,
-                    )
+            try:
+                canonical = adapter.reconstruct_response(
+                    events, transport="sse" if is_sse else "ndjson",
+                )
+                canonical_payload = canonical.payload
+                raw_resp_text = json.dumps(canonical.payload, ensure_ascii=False)
+                response_reconstructed = canonical.reconstructed
+                response_complete = canonical.complete
+            except Exception as exc:
+                logger.warning("Adapter response reconstruction error: %s", exc, exc_info=True)
+                canonical_payload = None
+                response_complete = False
+                capture_error = _add_capture_error(
+                    capture_error, "response_reconstruction", exc,
+                )
         if canonical_payload is None and response_is_json:
             capture_error = _add_capture_error(
                 capture_error,
@@ -576,7 +602,7 @@ class ContextSpyAddon:
         status_code = flow.response.status_code if flow.response else None
         canonical_invocation, analyzed, capture_error = self._normalize_and_analyze(
             provider=provider,
-            endpoint=endpoint,
+            adapter=adapter,
             protocol_id=f"http_{response_transport}",
             req_body=req_body,
             raw_request_body=raw_request_body,
@@ -743,16 +769,31 @@ class ContextSpyAddon:
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         host = flow.request.pretty_host
-        port = flow.request.port
-        provider = self._get_provider(host, port)
-        if provider is None:
-            return  # not an LLM host
+        path = flow.request.path
+        route = self._route_for(host, flow.request.port)
+        if route is None:
+            logger.debug(
+                "provider_route_not_found host=%s path=%s transport=websocket",
+                host, path,
+            )
+            return
 
-        protocol = get_ws_protocol(host, flow.request.path)
+        protocol = get_ws_protocol(host, path)
         if protocol is None:
-            logger.info(
-                "WS connection to known provider %s has no registered WS protocol: %s%s",
-                provider, host, flow.request.path,
+            logger.debug(
+                "provider_endpoint_not_supported host=%s path=%s "
+                "provider=%s transport=websocket",
+                host, path, route.provider,
+            )
+            return
+
+        if not self._provider_registry.is_protocol_allowed(
+            route, protocol.provider_protocol,
+        ):
+            logger.warning(
+                "provider_protocol_not_allowed host=%s path=%s provider=%s "
+                "protocol=%s source=%s transport=websocket",
+                host, path, route.provider, protocol.provider_protocol, route.source,
             )
             return
 
@@ -760,12 +801,12 @@ class ContextSpyAddon:
         originator = flow.request.headers.get("originator", "")
         agent = _detect_agent(f"{user_agent} {originator}".strip())
         self._ws_flows[flow.id] = _WsFlowState(
-            session=protocol.new_session(), provider=provider, agent=agent,
-            endpoint=flow.request.path, protocol_id=protocol.protocol_id,
+            session=protocol.new_session(), provider=route.provider, agent=agent,
+            endpoint=path, protocol_id=protocol.protocol_id,
         )
         logger.debug(
             "HOOK websocket_start: %s %s provider=%s agent=%s protocol=%s",
-            host, flow.request.path[:60], provider, agent, protocol.protocol_id,
+            host, path[:60], route.provider, agent, protocol.protocol_id,
         )
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
@@ -820,9 +861,12 @@ class ContextSpyAddon:
         if flow.metadata.get("contextspy_saved"):
             return
 
-        provider = self._get_provider(flow.request.pretty_host, flow.request.port)
-        if provider is None:
+        admission = self._http_admission(flow)
+        if admission is None:
             return
+        route, adapter = admission
+        provider = route.provider
+
         endpoint = flow.request.path
         raw_request_body, request_capture_error = _captured_request_text(flow)
         capture_error = {
@@ -846,7 +890,7 @@ class ContextSpyAddon:
             capture_error["request_capture"] = request_capture_error
         canonical_invocation, analyzed, capture_error = self._normalize_and_analyze(
             provider=provider,
-            endpoint=endpoint,
+            adapter=adapter,
             protocol_id="http_error",
             req_body=req_body,
             raw_request_body=raw_request_body,
@@ -921,7 +965,7 @@ class ContextSpyAddon:
                 outcome = "completed"
         canonical_invocation, analyzed, capture_error = self._normalize_and_analyze(
             provider=state.provider,
-            endpoint=state.endpoint,
+            adapter=adapter,
             protocol_id=state.protocol_id,
             req_body=ex.request_body,
             raw_request_body=ex.raw_request_text,

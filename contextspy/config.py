@@ -50,13 +50,27 @@ class RetentionSettings:
     block_content_days: int = 7
 
 
+@dataclass(frozen=True)
+class ProviderRouteSettings:
+    """One ``[[provider_routes]]`` entry from TOML — config-time only.
+
+    Runtime uses the equivalent ``ProviderRoute`` (frozen, normalized, validated)
+    built once at startup by ``contextspy.proxy.providers.build_provider_registry``.
+    """
+
+    host: str
+    provider: str
+    include_subdomains: bool = False
+    allowed_protocols: tuple[str, ...] | None = None
+
+
 @dataclass
 class ReverseTarget:
     """A local LLM server to proxy in reverse mode."""
     name: str                   # human label, e.g. "llama-server"
     listen_port: int            # port contextspy listens on, e.g. 8889
     target_url: str             # upstream URL, e.g. "http://127.0.0.1:8080"
-    provider: str = "openai"    # parser to use: "openai" | "anthropic" | "ollama"
+    provider: str = "openai"    # stored label; request path selects the adapter
 
 
 @dataclass
@@ -65,7 +79,7 @@ class Settings:
     web: WebSettings = field(default_factory=WebSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
     retention: RetentionSettings = field(default_factory=RetentionSettings)
-    extra_hosts: list[str] = field(default_factory=list)
+    provider_routes: list[ProviderRouteSettings] = field(default_factory=list)
     reverse_targets: list[ReverseTarget] = field(default_factory=list)
     config_dir: Path = field(default_factory=lambda: _DEFAULT_DIR)
 
@@ -95,7 +109,63 @@ class Settings:
                     "block_content_days", settings.retention.block_content_days
                 )
             if "intercepted_hosts" in data:
-                settings.extra_hosts = data["intercepted_hosts"].get("extra_hosts", [])
+                legacy = data["intercepted_hosts"]
+                if not isinstance(legacy, dict):
+                    raise ValueError("[intercepted_hosts] must be a TOML table")
+                legacy_hosts = legacy.get("extra_hosts", [])
+                if (
+                    not isinstance(legacy_hosts, list)
+                    or not all(isinstance(host, str) for host in legacy_hosts)
+                ):
+                    raise ValueError(
+                        "[intercepted_hosts].extra_hosts must be an array of strings"
+                    )
+                if legacy_hosts:
+                    raise ValueError(
+                        "[intercepted_hosts].extra_hosts is non-empty; convert each "
+                        "host to [[provider_routes]] and set an explicit provider value"
+                    )
+            if "provider_routes" in data:
+                route_tables = data["provider_routes"]
+                if not isinstance(route_tables, list):
+                    raise ValueError("provider_routes must be an array of tables")
+                for index, route in enumerate(route_tables):
+                    if not isinstance(route, dict):
+                        raise ValueError(
+                            f"provider_routes[{index}] must be a TOML table"
+                        )
+                    for required in ("host", "provider"):
+                        if required not in route:
+                            raise ValueError(
+                                f"provider_routes[{index}].{required} is required"
+                            )
+                        if not isinstance(route[required], str):
+                            raise ValueError(
+                                f"provider_routes[{index}].{required} must be a string"
+                            )
+                    include_subdomains = route.get("include_subdomains", False)
+                    if not isinstance(include_subdomains, bool):
+                        raise ValueError(
+                            f"provider_routes[{index}].include_subdomains "
+                            "must be a boolean"
+                        )
+                    raw_protocols = route.get("allowed_protocols")
+                    if raw_protocols is not None and (
+                        not isinstance(raw_protocols, list)
+                        or not all(isinstance(value, str) for value in raw_protocols)
+                    ):
+                        raise ValueError(
+                            f"provider_routes[{index}].allowed_protocols "
+                            "must be an array of strings"
+                        )
+                    settings.provider_routes.append(ProviderRouteSettings(
+                        host=route["host"],
+                        provider=route["provider"],
+                        include_subdomains=include_subdomains,
+                        allowed_protocols=(
+                            tuple(raw_protocols) if raw_protocols is not None else None
+                        ),
+                    ))
             if "reverse_targets" in data:
                 for rt in data["reverse_targets"]:
                     settings.reverse_targets.append(
@@ -136,9 +206,20 @@ db_path = "{db_path_toml}"
 raw_body_days = {self.retention.raw_body_days}
 block_content_days = {self.retention.block_content_days}
 
-[intercepted_hosts]
-# Add extra hosts if needed (besides the built-in list)
-extra_hosts = []
+# Add a cloud gateway without rebuilding ContextSpy. Host must be a bare
+# hostname (no scheme, port, path, or wildcard). Omit allowed_protocols to
+# allow every registered protocol; set it to limit the captured wire formats.
+# Built-in providers (api.openai.com, api.anthropic.com, chatgpt.com, …) are
+# already covered — only add entries for custom / enterprise hosts.
+# [[provider_routes]]
+# host = "gateway.example.com"
+# provider = "enterprise_gateway"
+# include_subdomains = false
+# allowed_protocols = [
+#   "openai_chat",
+#   "openai_responses",
+#   "anthropic",
+# ]
 
 # Uncomment and edit to enable local reverse-proxy mode.
 # Each [[reverse_targets]] block defines one local LLM server to intercept.
@@ -146,7 +227,7 @@ extra_hosts = []
 # name        = "llama-server"   # display label
 # listen_port = 8889             # port contextspy listens on
 # target_url  = "http://127.0.0.1:8080"  # where your server actually runs
-# provider    = "openai"         # parser: "openai" | "anthropic" | "ollama"
+# provider    = "openai"         # stored label; request path selects the adapter
 """,
                 encoding="utf-8",
             )

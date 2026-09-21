@@ -57,6 +57,8 @@ cd ui && npm run build   # outputs to contextspy/_web/
 coding agent → HTTPS_PROXY → mitmproxy (port 8888)
                                   │
                             ContextSpyAddon (intercepts here)
+                              → match provider route, endpoint, and protocol
+                              → read admitted request/response bodies
                               → identify one provider invocation
                               → normalize provider state into canonical JSON
                               → parse canonical request/response JSON only
@@ -74,14 +76,16 @@ client (base_url=:8889) → mitmproxy reverse proxy (port 8889)
                                   │ plain HTTP forward
                             llama-server / Ollama / vLLM (port 8080…)
                                   │
-                            ContextSpyAddon (per-target provider_override;
-                                              commonly "openai")
+                            ContextSpyAddon (per-target fixed ProviderRoute;
+                                              provider is the stored label)
                               → capture/reconstruct, parse, classify, count tokens
                               → write to SQLite
                               → broadcast via WebSocket
 ```
 
-Both modes share the same FastAPI web server (port 5173), SQLite database, and dashboard.
+Both modes share the same FastAPI web server (port 5173), SQLite database, dashboard, and
+startup-built provider registry. The registry also drives PAC generation; unmatched hosts,
+unsupported endpoints, and disallowed protocols are forwarded without reading their bodies.
 
 ---
 

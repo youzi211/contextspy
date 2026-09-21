@@ -35,6 +35,29 @@ Options:
 --no-browser         Don't open the browser automatically
 ```
 
+### Optional — configure a custom provider route
+
+Built-in provider hosts work without configuration. To capture a custom or enterprise gateway,
+add a `[[provider_routes]]` block to `~/.contextspy/config.toml` before starting ContextSpy:
+
+```toml
+[[provider_routes]]
+host = "gateway.example.com"
+provider = "enterprise_gateway"
+include_subdomains = false
+allowed_protocols = ["openai_chat", "openai_responses"]
+```
+
+`host` must be a bare hostname without a scheme, port, path, or wildcard, and cannot duplicate a
+built-in or configured host. `provider` is the label stored with captured requests and must match
+`[a-z][a-z0-9_]*`. `include_subdomains = true` also matches subdomains. Omit `allowed_protocols`
+to allow every registered protocol, or set a non-empty list containing any of `anthropic`,
+`openai_chat`, `openai_responses`, and `ollama`. Configured hosts and their subdomain settings are
+included in the PAC file served at `/api/proxy.pac`.
+
+The legacy `[intercepted_hosts].extra_hosts` setting is no longer accepted when non-empty. Convert
+each host to a `[[provider_routes]]` block and assign an explicit `provider` label.
+
 ---
 
 ## Step 2 — Configure your agent

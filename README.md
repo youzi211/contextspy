@@ -106,7 +106,10 @@ database. A local web server serves the dashboard used to explore the captured d
 
 No, it does not send any data to the cloud. All data is stored locally on your machine.
 
-But users must be aware, that it will be running proxy, and capturing all traffic from agent to LLM provider - and storing it locally to be displayed and analysed in the UI.
+But users must be aware that it runs a proxy. ContextSpy reads and stores request and response
+bodies only when the destination matches a built-in or configured provider route, the request
+path matches a supported wire-format adapter, and that protocol is allowed by the route. Other
+traffic is forwarded without a ContextSpy record.
 The proxy and dashboard server are bound to localhost, and not exposed to external access, but still could be accessed locally.
 
 The intended use case is to run ContextSpy as a profiler tool on dedicated profiling and optimisation sessions, rather than keeping it permanently as a monitoring tool.
@@ -156,8 +159,8 @@ If that name already exists, `-1`, `-2`, and so on is added before `.back`.
 ## Features
 
 - **Two proxy modes** — forward proxy for supported cloud APIs (OpenAI, Anthropic, Azure OpenAI,
-  Copilot, opencode's gateway, and Codex's ChatGPT backend); reverse proxy for local LLM servers
-  (Ollama, llama.cpp, vLLM)
+  Copilot, opencode's gateway, Codex's ChatGPT backend, and configured custom gateways); reverse
+  proxy for local LLM servers (Ollama, llama.cpp, vLLM)
 - **Context breakdown** — input tokens split into 8 categories:
   system prompt, tool definitions, tool results, file contents, conversation history,
   current user message, assistant prefill, uncategorised
