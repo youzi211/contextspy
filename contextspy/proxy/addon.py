@@ -769,16 +769,31 @@ class ContextSpyAddon:
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         host = flow.request.pretty_host
-        port = flow.request.port
-        provider = self._get_provider(host, port)
-        if provider is None:
-            return  # not an LLM host
+        path = flow.request.path
+        route = self._route_for(host, flow.request.port)
+        if route is None:
+            logger.debug(
+                "provider_route_not_found host=%s path=%s transport=websocket",
+                host, path,
+            )
+            return
 
-        protocol = get_ws_protocol(host, flow.request.path)
+        protocol = get_ws_protocol(host, path)
         if protocol is None:
-            logger.info(
-                "WS connection to known provider %s has no registered WS protocol: %s%s",
-                provider, host, flow.request.path,
+            logger.debug(
+                "provider_endpoint_not_supported host=%s path=%s "
+                "provider=%s transport=websocket",
+                host, path, route.provider,
+            )
+            return
+
+        if not self._provider_registry.is_protocol_allowed(
+            route, protocol.provider_protocol,
+        ):
+            logger.warning(
+                "provider_protocol_not_allowed host=%s path=%s provider=%s "
+                "protocol=%s source=%s transport=websocket",
+                host, path, route.provider, protocol.provider_protocol, route.source,
             )
             return
 
@@ -786,12 +801,12 @@ class ContextSpyAddon:
         originator = flow.request.headers.get("originator", "")
         agent = _detect_agent(f"{user_agent} {originator}".strip())
         self._ws_flows[flow.id] = _WsFlowState(
-            session=protocol.new_session(), provider=provider, agent=agent,
-            endpoint=flow.request.path, protocol_id=protocol.protocol_id,
+            session=protocol.new_session(), provider=route.provider, agent=agent,
+            endpoint=path, protocol_id=protocol.protocol_id,
         )
         logger.debug(
             "HOOK websocket_start: %s %s provider=%s agent=%s protocol=%s",
-            host, flow.request.path[:60], provider, agent, protocol.protocol_id,
+            host, path[:60], route.provider, agent, protocol.protocol_id,
         )
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:

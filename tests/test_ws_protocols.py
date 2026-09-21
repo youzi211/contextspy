@@ -74,6 +74,7 @@ class TestGetWsProtocol:
         protocol = get_ws_protocol("chatgpt.com", "/backend-api/codex/responses")
         assert protocol is not None
         assert protocol.protocol_id == "codex_responses"
+        assert protocol.provider_protocol == "openai_responses"
 
     def test_wrong_host(self):
         assert get_ws_protocol("api.openai.com", "/backend-api/codex/responses") is None
@@ -304,3 +305,68 @@ class TestCodexSession:
         assert len(result) == 1
         assert result[0].events[0].direction == "client_to_server"
         assert result[0].events[0].payload == {"type": "client.control", "value": 1}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket admission against ProviderRegistry (Task 5)
+# ---------------------------------------------------------------------------
+
+
+def _ws_flow(host: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=f"ws-{host}",
+        request=SimpleNamespace(
+            pretty_host=host,
+            port=443,
+            path="/backend-api/codex/responses",
+            headers={"user-agent": "codex_cli_rs"},
+        ),
+        websocket=SimpleNamespace(messages=[]),
+        metadata={},
+    )
+
+
+def test_websocket_allowed_protocol_creates_session():
+    from contextspy.config import ProviderRouteSettings
+    from contextspy.proxy.addon import ContextSpyAddon
+    from contextspy.proxy.providers import build_provider_registry
+
+    registry = build_provider_registry([ProviderRouteSettings(
+        host="allowed.chatgpt.com",
+        provider="enterprise_codex",
+        allowed_protocols=("openai_responses",),
+    )])
+    flow = _ws_flow("allowed.chatgpt.com")
+    addon = ContextSpyAddon(registry)
+    addon.websocket_start(flow)
+    assert addon._ws_flows[flow.id].provider == "enterprise_codex"
+    assert addon._ws_flows[flow.id].protocol_id == "codex_responses"
+
+
+def test_websocket_protocol_whitelist_rejects_before_session_creation():
+    from types import SimpleNamespace
+
+    from contextspy.config import ProviderRouteSettings
+    from contextspy.proxy.addon import ContextSpyAddon
+    from contextspy.proxy.providers import build_provider_registry
+
+    registry = build_provider_registry([ProviderRouteSettings(
+        host="denied.chatgpt.com",
+        provider="enterprise_codex",
+        allowed_protocols=("anthropic",),
+    )])
+    flow = _ws_flow("denied.chatgpt.com")
+    addon = ContextSpyAddon(registry)
+    addon.websocket_start(flow)
+    assert flow.id not in addon._ws_flows
+
+    flow.websocket.messages.append(SimpleNamespace(
+        from_client=True,
+        content=b'{"type":"response.create","input":"secret"}',
+        is_text=True,
+        timestamp=1.0,
+    ))
+    addon.websocket_message(flow)
+    assert flow.id not in addon._ws_flows

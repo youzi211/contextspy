@@ -188,6 +188,7 @@ class CodexResponsesSession(WsSession):
 
 class CodexResponsesProtocol(WsProtocol):
     protocol_id = "codex_responses"
+    provider_protocol = "openai_responses"
     host_patterns = ("chatgpt.com",)
     path_patterns = ("/backend-api/codex/responses",)
 
