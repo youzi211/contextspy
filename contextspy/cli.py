@@ -110,9 +110,26 @@ def _base_proxy_env(proxy_port: int) -> dict[str, str]:
     env["http_proxy"] = url
     env["HTTPS_PROXY"] = url
     env["https_proxy"] = url
+    env["ALL_PROXY"] = url
+    env["all_proxy"] = url
     env["NO_PROXY"] = "github.com,localhost,127.0.0.1,::1"
     env["no_proxy"] = env["NO_PROXY"]
     return env
+
+
+def _codex_dotenv_proxy_conflicts(codex_home: pathlib.Path, proxy_url: str) -> list[str]:
+    """Find proxy settings Codex would load after inheriting our environment."""
+    path = codex_home / ".env"
+    if not path.exists():
+        return []
+    conflicts: list[str] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key.upper() in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}:
+            if value.strip().strip('"\'') != proxy_url:
+                conflicts.append(key)
+    return conflicts
 
 
 def _inject_node_cert(env: dict[str, str], cert: pathlib.Path) -> None:
@@ -179,6 +196,8 @@ def start(
     proxy_port: int = typer.Option(8888, "--proxy-port", help="Proxy listen port"),
     web_port: int = typer.Option(5173, "--web-port", help="Web server listen port"),
     no_browser: bool = typer.Option(False, "--no-browser", help="Don't open browser"),
+    upstream_proxy: Optional[str] = typer.Option(None, "--upstream-proxy", help="Upstream HTTP proxy URL"),
+    direct: bool = typer.Option(False, "--direct", help="Connect to providers directly, ignoring configured upstream proxy"),
 ) -> None:
     """Start the proxy and web server in cloud/forward mode (Ctrl+C to stop)."""
     import uvicorn
@@ -189,6 +208,13 @@ def start(
     settings = Settings.load()
     settings.proxy.port = proxy_port
     settings.web.port = web_port
+    if direct and upstream_proxy is not None:
+        console.print("[red]Error:[/red] --direct and --upstream-proxy cannot be used together.")
+        raise typer.Exit(2)
+    if upstream_proxy is not None:
+        settings.proxy.upstream_url = upstream_proxy
+    elif direct:
+        settings.proxy.upstream_url = None
     settings.ensure_dirs()
     settings.write_defaults()
     _abort_if_migrations_pending(settings)
@@ -212,6 +238,8 @@ def start(
     url = f"http://{settings.web.bind_addr}:{settings.web.port}"
     console.print(f"[bold green]ContextSpy[/bold green] starting at {url}")
     console.print(f"  Proxy:  {settings.proxy.bind_addr}:{settings.proxy.port}")
+    if settings.proxy.upstream_url:
+        console.print(f"  Upstream: {settings.proxy.upstream_url}")
     console.print(f"  DB:     {settings.storage.db_path}")
     console.print("Press [bold]Ctrl+C[/bold] to stop.\n")
 
@@ -475,7 +503,11 @@ def run_cmd(
     cert = _cert_path()
 
     try:
-        httpx.get(f"http://127.0.0.1:{settings.web.port}/api/stats", timeout=1.0)
+        response = httpx.get(_api(settings.web.port, "/proxy/status"), timeout=1.0)
+        response.raise_for_status()
+        proxy_status = response.json()
+        if not proxy_status["running"] or proxy_status["port"] != port:
+            raise RuntimeError("ContextSpy proxy is not listening on the selected port")
     except Exception:
         console.print(
             "[red]Error:[/red] ContextSpy is not running. "
@@ -484,6 +516,17 @@ def run_cmd(
         raise typer.Exit(1)
 
     env = _base_proxy_env(port)
+    if tool.lower() == "codex":
+        codex_home = pathlib.Path(env.get("CODEX_HOME") or pathlib.Path.home() / ".codex")
+        conflicts = _codex_dotenv_proxy_conflicts(codex_home, env["HTTPS_PROXY"])
+        if conflicts:
+            console.print(
+                "[red]Error:[/red] Codex loads proxy settings from "
+                f"{codex_home / '.env'} after launch, overriding ContextSpy: "
+                f"{', '.join(conflicts)}. Remove those proxy entries from that file "
+                "(keep other settings), then retry."
+            )
+            raise typer.Exit(1)
     injectors = _TOOL_INJECTORS.get(tool, [])
     for inject in injectors:
         inject(env, cert)
@@ -515,7 +558,34 @@ def run_cmd(
     console.print(
         f"[dim]contextspy run: {' '.join(cmd)}  HTTPS_PROXY={env['HTTPS_PROXY']}[/dim]"
     )
-    result = subprocess.run(cmd, env=env, shell=(os.name == "nt"))
+    from datetime import datetime
+
+    created_session_id: str | None = None
+    try:
+        response = httpx.get(_api(settings.web.port, "/sessions"), timeout=5)
+        response.raise_for_status()
+        if not any(s["is_active"] for s in response.json()["sessions"]):
+            name = f"{tool} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            response = httpx.post(
+                _api(settings.web.port, "/sessions"), json={"name": name}, timeout=5,
+            )
+            response.raise_for_status()
+            created_session_id = response.json()["session"]["id"]
+            console.print(f"[green]Session started:[/green] {name}")
+    except Exception as exc:
+        console.print(f"[red]Error creating capture session:[/red] {exc}")
+        raise typer.Exit(1)
+
+    try:
+        result = subprocess.run(cmd, env=env, shell=(os.name == "nt"))
+    finally:
+        if created_session_id is not None:
+            try:
+                httpx.post(
+                    _api(settings.web.port, f"/sessions/{created_session_id}/end"), timeout=5,
+                ).raise_for_status()
+            except Exception as exc:
+                console.print(f"[yellow]Could not end session {created_session_id}: {exc}[/yellow]")
     raise typer.Exit(result.returncode)
 
 
@@ -1173,9 +1243,9 @@ def setup_codex() -> None:
     console.print('  export no_proxy="github.com,localhost,127.0.0.1,::1"')
     console.print()
     console.print(
-        "[dim]Codex doesn't read ~/.codex/.env for this — it only inherits whatever's "
-        "in the process environment when it starts, so the vars above must be exported "
-        "in the actual shell (or use contextspy run) rather than placed in that file.[/dim]"
+        "[dim]Codex loads ~/.codex/.env after launch. Proxy entries in that file "
+        "override the variables set by contextspy run. Remove HTTP_PROXY, HTTPS_PROXY, "
+        "and ALL_PROXY entries from that file before using the runner.[/dim]"
     )
     console.print(
         "[dim]Run [bold]contextspy install-cert[/bold] first if you see TLS/certificate errors.[/dim]\n"

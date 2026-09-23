@@ -183,9 +183,14 @@ $env:HTTPS_PROXY = "http://127.0.0.1:8888"
 $env:NO_PROXY = "github.com,localhost,127.0.0.1,::1"
 ```
 
-> Codex does not read `~/.codex/.env` for proxy settings — it only inherits whatever is
-> already in the process environment when it starts. Export the variables in the shell
-> that launches `codex` (or use `contextspy run codex`), not a dotfile.
+> Codex loads proxy settings from `~/.codex/.env` after launch, overriding the
+> environment set by `contextspy run`. Remove `HTTP_PROXY`, `HTTPS_PROXY`, and
+> `ALL_PROXY` entries from that file before using the runner. If this machine
+> needs another proxy for internet access, set `[proxy].upstream_url` in
+> `~/.contextspy/config.toml` (for example `http://127.0.0.1:7890`).
+> To capture an internal gateway through ContextSpy without that upstream,
+> start with `contextspy start --direct`. If Codex connects directly to the
+> gateway without passing through ContextSpy at all, no traffic can be captured.
 
 If you're logged in via a **ChatGPT plan** (rather than an API key), Codex defaults to a
 WebSocket transport for its private `chatgpt.com/backend-api/codex/responses` endpoint.

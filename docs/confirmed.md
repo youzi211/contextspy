@@ -74,10 +74,9 @@ verified yet. If you get one working, please open an issue or PR so it can be ad
       <td>
         Cloud mode — <code>contextspy run codex .</code> (preferred) or
         <code>contextspy setup-codex</code>.<br><br>
-        <strong>Codex does not read <code>~/.codex/.env</code> for proxy settings</strong> — it only inherits
-        the environment of the shell that launches it. Export <code>HTTPS_PROXY</code> and
-        <code>NO_PROXY</code> in that shell (or use <code>contextspy run</code>); putting them in a dotfile
-        or in <code>~/.codex/config.toml</code> has no effect.<br><br>
+        <strong>Codex loads <code>~/.codex/.env</code> after launch.</strong> Proxy entries there override
+        <code>contextspy run</code>. Remove those entries before using the runner. If an upstream proxy
+        is needed, set <code>[proxy].upstream_url</code> in ContextSpy's config.<br><br>
         No <code>NODE_EXTRA_CA_CERTS</code> needed — Codex is a Rust binary and uses the OS trust store,
         so <code>contextspy install-cert</code> is sufficient.
       </td>

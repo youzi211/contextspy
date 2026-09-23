@@ -101,6 +101,8 @@ contextspy session list           List session names, IDs, timestamps, and activ
 ```
 
 These commands require the dashboard/API to be running.
+`contextspy run` creates a session automatically if none is active and ends that
+session when the child command exits. An existing active session is reused.
 
 ---
 

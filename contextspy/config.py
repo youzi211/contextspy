@@ -26,6 +26,7 @@ _DEFAULT_DIR = Path.home() / ".contextspy"
 class ProxySettings:
     port: int = 8888
     bind_addr: str = "127.0.0.1"
+    upstream_url: str | None = None
 
 
 @dataclass
@@ -94,6 +95,7 @@ class Settings:
                 p = data["proxy"]
                 settings.proxy.port = p.get("port", settings.proxy.port)
                 settings.proxy.bind_addr = p.get("bind_addr", settings.proxy.bind_addr)
+                settings.proxy.upstream_url = p.get("upstream_url", settings.proxy.upstream_url)
             if "web" in data:
                 w = data["web"]
                 settings.web.port = w.get("port", settings.web.port)
@@ -191,6 +193,8 @@ class Settings:
                 f"""[proxy]
 port = {self.proxy.port}
 bind_addr = "{self.proxy.bind_addr}"
+# Set upstream_url if this machine needs another proxy to reach cloud APIs.
+# upstream_url = "http://127.0.0.1:7890"
 
 [web]
 port = {self.web.port}

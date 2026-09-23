@@ -109,6 +109,7 @@ def start_proxy(
     options = Options(
         listen_host=settings.proxy.bind_addr,
         listen_port=settings.proxy.port,
+        mode=[f"upstream:{settings.proxy.upstream_url}"] if settings.proxy.upstream_url else ["regular"],
         ssl_insecure=False,
     )
 
